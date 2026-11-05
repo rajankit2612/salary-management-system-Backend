@@ -1,0 +1,245 @@
+# Salary Management: Backend Plan (Simple Version, for Cursor AI)
+
+> Scope: **backend only**. Do NOT build the Angular UI yet.
+> Keep everything **simple**. No extra layers, no extra folders, no speculative abstractions.
+
+---
+
+## 0. How you (Cursor) must work
+
+1. **TDD**: write a failing test first, make it pass with the simplest code, then refactor.
+2. **Work phase by phase** (section 8). Stop at the end of each phase and wait for my go-ahead.
+3. **Do not add** folders, layers or features that are not listed in this document. If you think something is missing, ask me.
+4. Tests must be **fast, deterministic and readable**.
+5. After each phase, **append to `docs/ai-usage.md`**: the prompt used, what you generated, what was changed or rejected and why.
+6. Record non-obvious decisions in one line each in `docs/design-notes.md`.
+
+---
+
+## 1. Product context
+
+- ACME org, about **10,000 employees across multiple countries**.
+- User: a single **HR Manager** (no login or roles).
+- Goal: replace Excel sheets with software to manage employee salary data.
+
+**In scope (v1):** create, update, delete and view employees with their current salary; search, filter, sort and paginate the list; seed 10,000 employees.
+
+**Deliberately out of scope:** salary history, bonuses, tax or payroll rules, authentication, currency conversion, analytics endpoints (possible v2).
+
+---
+
+## 2. Tech stack
+
+| Concern | Choice |
+|---|---|
+| Language | Java 21 |
+| Framework | Spring Boot 3.x (Web, Validation, Data JPA) |
+| Build | Maven |
+| Database (dev/prod) | PostgreSQL (docker-compose for local) |
+| Database (tests) | H2 in PostgreSQL mode |
+| Migrations | Flyway |
+| API docs | springdoc-openapi |
+| Testing | JUnit 5, AssertJ, Mockito, `@WebMvcTest`, `@DataJpaTest` |
+
+---
+
+## 3. Folder structure (follow exactly)
+
+```
+src/
+├── main/
+│   ├── java/com/acme/salary/
+│   │   ├── SalaryApplication.java
+│   │   ├── DataSeeder.java
+│   │   │
+│   │   ├── controller/
+│   │   │   ├── EmployeeController.java
+│   │   │   └── GlobalExceptionHandler.java
+│   │   │
+│   │   ├── service/
+│   │   │   └── EmployeeService.java
+│   │   │
+│   │   ├── repository/
+│   │   │   └── EmployeeRepository.java
+│   │   │
+│   │   ├── dto/
+│   │   │   ├── EmployeeRequest.java
+│   │   │   └── EmployeeResponse.java
+│   │   │
+│   │   └── entity/
+│   │       └── Employee.java
+│   │
+│   └── resources/
+│       ├── application.yml
+│       └── db/migration/
+│           └── V1__create_employee_table.sql
+│
+└── test/
+    └── java/com/acme/salary/
+        ├── service/
+        │   └── EmployeeServiceTest.java
+        ├── controller/
+        │   └── EmployeeControllerTest.java
+        └── repository/
+            └── EmployeeRepositoryTest.java
+```
+
+Outside `src/` (project root): `pom.xml`, `docker-compose.yml`, `README.md`, and `docs/` containing `requirements.md`, `design-notes.md`, `ai-usage.md`.
+
+---
+
+## 4. Database schema (`V1__create_employee_table.sql`)
+
+A single table. Department, job title, country and currency are plain strings, with no reference tables.
+
+```sql
+CREATE TABLE employee (
+    id                BIGSERIAL      PRIMARY KEY,
+    employee_code     VARCHAR(20)    NOT NULL UNIQUE,     -- e.g. EMP-000001, system generated
+    first_name        VARCHAR(100)   NOT NULL,
+    last_name         VARCHAR(100)   NOT NULL,
+    email             VARCHAR(255)   NOT NULL UNIQUE,
+    department        VARCHAR(80)    NOT NULL,
+    job_title         VARCHAR(100)   NOT NULL,
+    country           VARCHAR(80)    NOT NULL,
+    currency          CHAR(3)        NOT NULL,            -- ISO 4217, e.g. INR, USD
+    salary            NUMERIC(14,2)  NOT NULL CHECK (salary > 0),   -- annual, in local currency
+    employment_status VARCHAR(20)    NOT NULL DEFAULT 'ACTIVE',     -- ACTIVE | ON_LEAVE | TERMINATED
+    joined_on         DATE           NOT NULL,
+    created_at        TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at        TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_employee_country    ON employee(country);
+CREATE INDEX idx_employee_department ON employee(department);
+CREATE INDEX idx_employee_status     ON employee(employment_status);
+CREATE INDEX idx_employee_last_name  ON employee(last_name, first_name);
+```
+
+Salary uses `BigDecimal` in Java. Never float or double.
+
+---
+
+## 5. Validation rules (in `EmployeeRequest`, enforced by Bean Validation, plus duplicate-email check in the service)
+
+| Field | Rule |
+|---|---|
+| firstName, lastName | required, 1 to 100 chars |
+| email | required, valid format, unique (409 on duplicate) |
+| department, jobTitle, country | required, not blank |
+| currency | required, exactly 3 uppercase letters |
+| salary | required, greater than 0, max 2 decimals |
+| joinedOn | required, not in the future |
+| employmentStatus | ACTIVE, ON_LEAVE or TERMINATED (default ACTIVE) |
+| employeeCode | generated by the system, not accepted from the client |
+
+---
+
+## 6. REST API (base path `/api/employees`)
+
+All endpoints live in `EmployeeController`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/employees/{id}` | Get a single employee (404 if not found) |
+| GET | `/api/employees` | **One endpoint** for list, search, filter, sort and pagination |
+| POST | `/api/employees` | Create (201 plus `Location` header) |
+| PUT | `/api/employees/{id}` | Update |
+| DELETE | `/api/employees/{id}` | Delete (204) |
+
+### `GET /api/employees` query parameters (all optional)
+
+| Param | Meaning |
+|---|---|
+| `q` | search text: matches first name, last name, email or employee code (case-insensitive, contains) |
+| `country` | exact match |
+| `department` | exact match |
+| `jobTitle` | exact match |
+| `status` | ACTIVE, ON_LEAVE or TERMINATED |
+| `page` | 0-based page number (default 0) |
+| `size` | page size (default 20, **max 100**) |
+| `sort` | e.g. `lastName,asc` or `salary,desc` (only allow: firstName, lastName, salary, joinedOn, country, department) |
+
+Behaviour:
+- No params: first page of all employees.
+- With `q` or filters: filtered results, still paginated.
+- Return Spring's `Page<EmployeeResponse>` shape: `content`, `number`, `size`, `totalElements`, `totalPages`.
+
+### Errors
+`GlobalExceptionHandler` returns a consistent JSON error (use Spring `ProblemDetail`): 400 for validation (include field errors), 404 not found, 409 duplicate email, 500 generic (no stack traces).
+
+---
+
+## 7. Implementation notes
+
+- **Entity** `Employee` maps the table above (enum for status).
+- **Repository**: `EmployeeRepository extends JpaRepository<Employee, Long>, JpaSpecificationExecutor<Employee>`. Build the dynamic `q` and filter conditions with `Specification` inside the service (no separate specifications class).
+- **Service**: all business logic, employee code generation, duplicate-email check, mapping entity to response (simple private methods, no MapStruct).
+- **Controller**: thin. Only HTTP concerns.
+- **Performance**: filtering, sorting and pagination happen in the database. Never load all 10,000 rows into memory. Cap `size` at 100.
+- **DataSeeder**:
+  - Runs only with Spring profile `seed`.
+  - Inserts **10,000 employees** using JDBC batch inserts (batch size about 1000).
+  - **Deterministic** (`new Random(42)`) and **idempotent** (skip if 10,000 or more rows already exist).
+  - Realistic data: about 8 to 10 countries with matching currencies, about 8 departments, about 25 job titles, salary ranges that vary by job title and country, joined dates spread over the last 10 years, about 90% ACTIVE, 7% ON_LEAVE, 3% TERMINATED, unique emails.
+  - Use embedded name lists only (no network).
+
+---
+
+## 8. Phased plan (stop after each phase)
+
+**Phase 1: Skeleton**
+- Maven project, Spring Boot app, `application.yml`, docker-compose Postgres, Flyway V1, H2 test config.
+- Create `docs/requirements.md` (one page, from section 1), `docs/design-notes.md`, `docs/ai-usage.md`.
+- Test: context-loads smoke test.
+
+**Phase 2: Create and get one employee (TDD)**
+- Entity, repository, DTOs, service (create, get by id, duplicate email, code generation), controller, `GlobalExceptionHandler`.
+- Tests: `EmployeeServiceTest` (Mockito), `EmployeeControllerTest` (`@WebMvcTest`: 201, 400, 404, 409).
+
+**Phase 3: Update and delete (TDD)**
+- Service and controller for PUT and DELETE.
+- Tests for success, not found, and duplicate email on update.
+
+**Phase 4: List with search, filter, sort and pagination (TDD)**
+- `GET /api/employees` with `Specification`, paging and sort allow-list.
+- Tests: `EmployeeRepositoryTest` (`@DataJpaTest`) for each filter, combined filters, paging and sorting; controller test for param binding and size cap.
+
+**Phase 5: Seeder**
+- `DataSeeder` with profile `seed`.
+- Verify on Postgres: 10,000 rows, re-run is a no-op, list endpoint responds fast.
+
+**Phase 6: Wrap-up**
+- OpenAPI docs, Dockerfile, README (how to run, test, seed), a short `docs/performance.md` (indexes, pagination, batch seeding).
+
+---
+
+## 9. Testing standards
+
+- Naming: `method_condition_expectedResult`, e.g. `create_withDuplicateEmail_throwsConflict`.
+- Arrange / Act / Assert, one behaviour per test, AssertJ assertions.
+- Service tests use Mockito. Repository tests use `@DataJpaTest` on H2. Controller tests use `@WebMvcTest` with a mocked service.
+- No Docker needed to run tests. Whole suite should run in seconds.
+
+---
+
+## 10. Commit conventions
+
+- Small commits, build green at each one.
+- Prefixes: `test:`, `feat:`, `refactor:`, `docs:`, `chore:`.
+- Show the TDD rhythm where practical: `test: rejects future joining date` then `feat: validate joining date`.
+
+---
+
+## 11. Definition of done (backend)
+
+- [ ] `mvn test` is green and fast.
+- [ ] App runs against Postgres via docker-compose; Flyway migrates cleanly.
+- [ ] Seed creates 10,000 employees; re-running does nothing.
+- [ ] All endpoints in section 6 work and appear in Swagger.
+- [ ] List endpoint responds well under a second on 10k rows.
+- [ ] README and `docs/` are complete.
+
+---
+
+**Start with Phase 1 only. When finished, summarize what you created and wait for my go-ahead.**
