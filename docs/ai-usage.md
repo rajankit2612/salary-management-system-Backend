@@ -11,3 +11,9 @@ Created empty classes under `com.example.SalaryManagementApplication` (controlle
 Prompt: implement the DTO and entity.
 
 Filled `Employee`, `EmployeeRequest`, and `EmployeeResponse`. Added `spring-boot-starter-validation` and `jakarta.persistence-api`. Did not add a datasource, Flyway SQL, or the data-jpa starter.
+
+## Lombok and enum package
+
+Prompt: create a separate folder for the enum, integrate Lombok, and replace getters and setters with `@Data`.
+
+Moved `EmploymentStatus` to `enums`. Added the Lombok dependency and `@Data` on `Employee`, `EmployeeRequest`, and `EmployeeResponse`. Removed the handwritten getters and setters.
